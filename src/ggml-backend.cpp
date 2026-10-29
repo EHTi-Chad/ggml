@@ -1862,16 +1862,37 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+// tierlm: optional timing of every split (TIERLM_PROFILE=1). Each split is waited for, so the times add up;
+// that costs some speed while it is on.
+static struct {
+    double  copy_us[GGML_SCHED_MAX_BACKENDS], compute_us[GGML_SCHED_MAX_BACKENDS];
+    int64_t splits[GGML_SCHED_MAX_BACKENDS], inputs[GGML_SCHED_MAX_BACKENDS], graphs;
+} g_sched_prof;
+
+void ggml_backend_sched_profile(double * copy_us, double * compute_us, int64_t * splits, int64_t * inputs, int64_t * graphs, bool reset) {
+    for (int i = 0; i < GGML_SCHED_MAX_BACKENDS; ++i) {
+        if (copy_us)    copy_us[i]    = g_sched_prof.copy_us[i];
+        if (compute_us) compute_us[i] = g_sched_prof.compute_us[i];
+        if (splits)     splits[i]     = g_sched_prof.splits[i];
+        if (inputs)     inputs[i]     = g_sched_prof.inputs[i];
+    }
+    if (graphs) *graphs = g_sched_prof.graphs;
+    if (reset) memset(&g_sched_prof, 0, sizeof(g_sched_prof));
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
     int prev_backend_id = -1;
+    static const bool prof = getenv("TIERLM_PROFILE") != nullptr;
+    if (prof) g_sched_prof.graphs++;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t prof_t0 = prof ? ggml_time_us() : 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1896,10 +1917,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        int64_t prof_t1 = 0;
+        if (prof) {
+            ggml_backend_synchronize(split_backend);
+            prof_t1 = ggml_time_us();
+            g_sched_prof.copy_us[split_backend_id] += (double)(prof_t1 - prof_t0);
+            g_sched_prof.splits[split_backend_id] += 1;
+            g_sched_prof.inputs[split_backend_id] += split->n_inputs;
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (prof) {
+                ggml_backend_synchronize(split_backend);
+                g_sched_prof.compute_us[split_backend_id] += (double)(ggml_time_us() - prof_t1);
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
