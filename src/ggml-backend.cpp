@@ -977,6 +977,9 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    // tierlm: let a CPU split that needs nothing copied from the GPU start while the GPU is still busy
+    bool overlap;
+
     int debug;
 
     // graph size of the current and the previous scheduling, used by the realloc callback and for debugging
@@ -1869,6 +1872,10 @@ static struct {
     int64_t splits[GGML_SCHED_MAX_BACKENDS], inputs[GGML_SCHED_MAX_BACKENDS], graphs;
 } g_sched_prof;
 
+void ggml_backend_sched_set_overlap(ggml_backend_sched_t sched, bool overlap) {
+    sched->overlap = overlap;
+}
+
 void ggml_backend_sched_profile(double * copy_us, double * compute_us, int64_t * splits, int64_t * inputs, int64_t * graphs, bool reset) {
     for (int i = 0; i < GGML_SCHED_MAX_BACKENDS; ++i) {
         if (copy_us)    copy_us[i]    = g_sched_prof.copy_us[i];
@@ -1896,7 +1903,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        // tierlm (overlap): a CPU split right after a GPU split, reading nothing from it, doesn't wait for it, so
+        // both work at once. Safe: the CPU never touches GPU memory, and anything it needs from the GPU arrives as
+        // an input, which waits; the CPU's own results go back to the GPU through inputs of a later split, which
+        // wait for the GPU first (ggml_backend_sched_copy_input).
+        const bool cpu_after_gpu = sched->overlap && prev_backend_id >= 0 &&
+            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+            ggml_backend_dev_type(ggml_backend_get_device(sched->backends[prev_backend_id])) != GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && !cpu_after_gpu) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
@@ -1906,10 +1920,57 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+        // tierlm (overlap): a CPU split's inputs that come from a GPU are fetched together, with one wait for all of
+        // them, instead of a wait for each (each wait costs tens of microseconds, and there are several per layer)
+        // The same the other way: a GPU split's inputs from the CPU are sent together (from pinned memory they don't
+        // wait for each other), then waited for once, so the CPU can reuse that memory right after.
+        ggml_backend_t fetched[GGML_SCHED_MAX_BACKENDS];
+        int n_fetched = 0;
+        const bool cpu_split = sched->overlap &&
+            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        const bool gpu_split = sched->overlap && !cpu_split && split_backend->iface.set_tensor_async != NULL;
+        bool sent = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+            struct ggml_tensor * input = split->inputs[input_id];
+            if (ggml_backend_sched_is_host_weight(input)) {
+                continue;
             }
+            if (cpu_split && !(input->flags & GGML_TENSOR_FLAG_INPUT)) {
+                ggml_backend_t ib = ggml_backend_sched_get_tensor_backend(sched, input);
+                ggml_backend_buffer_t ibuf = input->view_src ? input->view_src->buffer : input->buffer;
+                if (ib && ib != split_backend && ib->iface.get_tensor_async && ibuf &&
+                    ggml_backend_buffer_get_type(ibuf) == ggml_backend_get_default_buffer_type(ib)) {
+                    struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+                    ggml_backend_tensor_get_async(ib, input, input_cpy->data, 0, ggml_nbytes(input));
+                    bool seen = false;
+                    for (int f = 0; f < n_fetched; f++) seen = seen || fetched[f] == ib;
+                    if (!seen) fetched[n_fetched++] = ib;
+                    continue;
+                }
+            }
+            if (gpu_split && !(input->flags & GGML_TENSOR_FLAG_INPUT)) {
+                ggml_backend_t ib = ggml_backend_sched_get_tensor_backend(sched, input);
+                ggml_backend_buffer_t ibuf = input->view_src ? input->view_src->buffer : input->buffer;
+                struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+                ggml_backend_buffer_t cbuf = input_cpy->view_src ? input_cpy->view_src->buffer : input_cpy->buffer;
+                if (ib && ggml_backend_dev_type(ggml_backend_get_device(ib)) == GGML_BACKEND_DEVICE_TYPE_CPU && ibuf &&
+                    ggml_backend_buffer_is_host(ibuf) && cbuf &&
+                    ggml_backend_buffer_get_type(cbuf) == ggml_backend_get_default_buffer_type(split_backend)) {
+                    if (!sent) {
+                        ggml_backend_synchronize(split_backend);   // done with the copies' last contents
+                        sent = true;
+                    }
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    continue;
+                }
+            }
+            ggml_backend_sched_copy_input(sched, split, input);
+        }
+        for (int f = 0; f < n_fetched; f++) {
+            ggml_backend_synchronize(fetched[f]);
+        }
+        if (sent) {
+            ggml_backend_synchronize(split_backend);
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {

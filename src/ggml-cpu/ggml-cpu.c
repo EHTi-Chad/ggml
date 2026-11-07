@@ -3103,6 +3103,17 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+// tierlm (diagnostic, TIERLM_CPU_OP_TIMES=1): time per op kind on thread 0, each op including the wait for the
+// other threads after it; printed every 4000 CPU graphs. Off: one test per graph.
+static double tlm_op_us[GGML_OP_COUNT];
+static int64_t tlm_op_n[GGML_OP_COUNT];
+static int64_t tlm_graphs;
+static int tlm_op_times(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("TIERLM_CPU_OP_TIMES") != NULL;
+    return v;
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3145,6 +3156,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
+        const int64_t tlm_t0 = (state->ith == 0 && tlm_op_times()) ? ggml_time_us() : 0;
+        const int tlm_node = node_n;
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
@@ -3161,6 +3174,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+        if (tlm_t0) {
+            tlm_op_us[cgraph->nodes[tlm_node]->op] += (double)(ggml_time_us() - tlm_t0);
+            tlm_op_n[cgraph->nodes[tlm_node]->op]++;
+        }
+    }
+    if (state->ith == 0 && tlm_op_times() && ++tlm_graphs % 4000 == 0) {
+        double tot = 0;
+        for (int o = 0; o < GGML_OP_COUNT; o++) tot += tlm_op_us[o];
+        fprintf(stderr, "cpu op times over %lld graphs (%.1f ms):", (long long)4000, tot / 1000.0);
+        for (int o = 0; o < GGML_OP_COUNT; o++) {
+            if (tlm_op_n[o]) fprintf(stderr, " %s %.1fms/%lld", ggml_op_name((enum ggml_op)o), tlm_op_us[o] / 1000.0, (long long)tlm_op_n[o]);
+            tlm_op_us[o] = 0; tlm_op_n[o] = 0;
+        }
+        fprintf(stderr, "\n");
     }
 
 #ifdef GGML_USE_OPENMP

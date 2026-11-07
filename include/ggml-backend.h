@@ -371,6 +371,8 @@ extern "C" {
 
     // tierlm: split timing collected while TIERLM_PROFILE is set; arrays have 16 entries (GGML_SCHED_MAX_BACKENDS),
     // indexed like the backends given to ggml_backend_sched_new. Any pointer may be NULL.
+    // tierlm: a CPU split that needs nothing copied from the GPU split before it starts at once (both work together)
+    GGML_API void                 ggml_backend_sched_set_overlap(ggml_backend_sched_t sched, bool overlap);
     GGML_API void                 ggml_backend_sched_profile(double * copy_us, double * compute_us, int64_t * splits, int64_t * inputs, int64_t * graphs, bool reset);
 
     // Set a callback to be called for each resulting node during graph compute
