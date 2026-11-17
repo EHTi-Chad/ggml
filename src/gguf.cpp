@@ -327,7 +327,7 @@ struct gguf_reader {
         if (!read(tmp)) {
             return false;
         }
-        dst = ggml_type(tmp);
+        dst = (tmp >= 0 && tmp < GGML_TYPE_COUNT) ? ggml_type(tmp) : GGML_TYPE_COUNT; // tierlm: an out-of-range type number becomes GGML_TYPE_COUNT, which the caller refuses (casting it straight to the enum is undefined behaviour)
         return true;
     }
 
@@ -336,7 +336,7 @@ struct gguf_reader {
         if (!read(tmp)) {
             return false;
         }
-        dst = gguf_type(tmp);
+        dst = (tmp >= 0 && tmp < GGUF_TYPE_COUNT) ? gguf_type(tmp) : GGUF_TYPE_COUNT; // tierlm: as above; GGUF_TYPE_COUNT falls to the caller's "invalid GGUF type" error
         return true;
     }
 
